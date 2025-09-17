@@ -2,7 +2,7 @@ bl_info = {
     "name": "Quick Export Maps Pro (Material Sync)",
     "blender": (4, 2, 0),
     "category": "Material",
-    "author": " Lumorx Studio "
+    "author": " Lumorx Studio ",
     "version": (1, 6),
     "description": "Export textures by material with presets (Unreal, Unity, Packed MRAO, Full PBR)",
 }
@@ -12,8 +12,16 @@ import os
 import numpy as np
 
 # =========================
-#   Properties & Presets
+#   Helpers / Settings
 # =========================
+
+EXT_MAP = {
+    "PNG": "png",
+    "JPEG": "jpg",
+    "TARGA": "tga",
+    "BMP": "bmp",
+    "TIFF": "tif",
+}
 
 def update_preset(self, context):
     preset = self.preset
@@ -70,17 +78,19 @@ class QEMPProperties(bpy.types.PropertyGroup):
 #   Export Helpers
 # =========================
 
-def export_image(image, mat_name, suffix, props, export_dir, operator):
+def export_image(image, mat_name, suffix, props, export_dir, operator=None):
     """Lưu 1 ảnh texture ra file"""
     if not image:
         return
-    ext = props.image_format.lower() if props.image_format != "JPEG" else "jpg"
-    filename = f"{props.prefix}{mat_name.replace('.', '_')}_{suffix}{props.suffix}.{ext}"
+    ext = EXT_MAP.get(props.image_format, props.image_format.lower())
+    safe_mat = mat_name.replace('.', '_')
+    filename = f"{props.prefix}{safe_mat}_{suffix}{props.suffix}.{ext}"
     filepath = os.path.join(export_dir, filename)
 
-    image.filepath_raw = filepath
-    image.file_format = props.image_format
     try:
+        # set absolute path for Blender
+        image.filepath_raw = bpy.path.abspath(filepath)
+        image.file_format = props.image_format
         image.save()
         if operator:
             operator.report({'INFO'}, f"✅ Xuất {suffix}: {filepath}")
@@ -88,13 +98,19 @@ def export_image(image, mat_name, suffix, props, export_dir, operator):
         if operator:
             operator.report({'ERROR'}, f"❌ Lỗi khi lưu {suffix}: {filepath} ({str(e)})")
 
-def export_packed_mrao(mat, mat_dir, props, operator):
+def export_packed_mrao(mat, mat_dir, props, operator=None):
+    """Tạo ảnh packed M=R=A (R->R, G->Roughness, B->AO)"""
+    if not getattr(mat, "node_tree", None):
+        if operator:
+            operator.report({'WARNING'}, f"Material {mat.name} không có node tree.")
+        return
+
     nodes = mat.node_tree.nodes
 
     def find_image_map(keyword):
         for node in nodes:
             if node.type == 'TEX_IMAGE' and node.image:
-                if keyword in node.image.name.upper():
+                if keyword in (node.image.name or "").upper() or keyword in (node.name or "").upper() or keyword in (node.label or "").upper():
                     return node.image
         return None
 
@@ -110,6 +126,12 @@ def export_packed_mrao(mat, mat_dir, props, operator):
     base_img = img_metallic or img_roughness or img_ao
     width, height = base_img.size
 
+    for img in (img_metallic, img_roughness, img_ao):
+        if img and img.size != (width, height):
+            if operator:
+                operator.report({'WARNING'}, f"Kích thước ảnh không khớp trong {mat.name}. Bỏ packing.")
+            return
+
     packed_img = bpy.data.images.new(
         name=f"{mat.name}_Packed_MRAO",
         width=width,
@@ -120,36 +142,43 @@ def export_packed_mrao(mat, mat_dir, props, operator):
 
     def get_gray_pixels(image):
         if not image:
-            return np.zeros((width * height,))
-        image.pixels[:]  # force update
-        pixels = np.array(image.pixels[:])
-        if len(pixels) < width * height * 4:
-            return np.zeros((width * height,))
-        return pixels[0::4]
+            return np.zeros((width * height,), dtype=float)
+        raw = list(image.pixels[:])
+        if len(raw) < width * height * 4:
+            return np.zeros((width * height,), dtype=float)
+        arr = np.array(raw, dtype=float)
+        return arr[0::4]
 
     r_chan = get_gray_pixels(img_metallic)
     g_chan = get_gray_pixels(img_roughness)
     b_chan = get_gray_pixels(img_ao)
 
-    new_pixels = []
-    for i in range(width * height):
-        new_pixels.extend((r_chan[i], g_chan[i], b_chan[i], 1.0))
+    new_pixels = np.empty((width * height * 4,), dtype=float)
+    new_pixels[0::4] = r_chan
+    new_pixels[1::4] = g_chan
+    new_pixels[2::4] = b_chan
+    new_pixels[3::4] = 1.0
 
-    packed_img.pixels = new_pixels
+    packed_img.pixels = new_pixels.tolist()
 
-    ext = props.image_format.lower() if props.image_format != "JPEG" else "jpg"
+    ext = EXT_MAP.get(props.image_format, props.image_format.lower())
     filename = f"{props.prefix}{mat.name.replace('.', '_')}_packedMRAO{props.suffix}.{ext}"
     filepath = os.path.join(mat_dir, filename)
 
-    packed_img.filepath_raw = filepath
-    packed_img.file_format = props.image_format
     try:
+        packed_img.filepath_raw = bpy.path.abspath(filepath)
+        packed_img.file_format = props.image_format
         packed_img.save()
         if operator:
             operator.report({'INFO'}, f"✅ Xuất packed MRAO: {filepath}")
     except Exception as e:
         if operator:
             operator.report({'ERROR'}, f"❌ Lỗi khi lưu packed MRAO {filepath}: {str(e)}")
+    finally:
+        try:
+            bpy.data.images.remove(packed_img)
+        except Exception:
+            pass
 
 # =========================
 #   Export Main
@@ -161,11 +190,11 @@ def export_maps(objects, props, operator=None):
 
     exported_mats = set()
     for obj in objects:
-        if not obj.material_slots:
+        if not getattr(obj, "material_slots", None):
             continue
         for slot in obj.material_slots:
             mat = slot.material
-            if not mat or not mat.use_nodes:
+            if not mat or not getattr(mat, "use_nodes", False):
                 continue
             if mat.name in exported_mats:
                 continue
@@ -178,27 +207,52 @@ def export_maps(objects, props, operator=None):
             if props.preset == "PACKED_MRAO":
                 export_packed_mrao(mat, mat_dir, props, operator)
             else:
-                for node in mat.node_tree.nodes:
-                    if node.type == "TEX_IMAGE" and node.image:
-                        name = node.image.name.lower()
-                        if "base" in name or "albedo" in name:
-                            export_image(node.image, mat.name, "BaseColor", props, mat_dir, operator)
-                        elif "normal" in name:
-                            export_image(node.image, mat.name, "Normal", props, mat_dir, operator)
-                        elif "rough" in name:
-                            export_image(node.image, mat.name, "Roughness", props, mat_dir, operator)
-                        elif "metal" in name:
-                            export_image(node.image, mat.name, "Metallic", props, mat_dir, operator)
-                        elif "ao" in name or "occlusion" in name:
-                            export_image(node.image, mat.name, "AO", props, mat_dir, operator)
-                        elif "emis" in name:
-                            export_image(node.image, mat.name, "Emissive", props, mat_dir, operator)
-                        elif "height" in name or "disp" in name:
-                            export_image(node.image, mat.name, "Height", props, mat_dir, operator)
-                        elif "alpha" in name or "opacity" in name:
-                            export_image(node.image, mat.name, "Opacity", props, mat_dir, operator)
-                        elif "spec" in name:
-                            export_image(node.image, mat.name, "Specular", props, mat_dir, operator)
+                # Lấy tất cả TEX_IMAGE node (không cần nối vào BSDF)
+                if not getattr(mat, "node_tree", None):
+                    continue
+
+                tex_nodes = [n for n in mat.node_tree.nodes if n.type == "TEX_IMAGE" and getattr(n, "image", None)]
+                exported_images = set()  # tránh xuất trùng cùng 1 image nhiều lần
+
+                for node in tex_nodes:
+                    img = node.image
+                    if not img:
+                        continue
+                    # tránh trùng
+                    if img.name in exported_images:
+                        continue
+                    exported_images.add(img.name)
+
+                    # kiểm tra cả image.name, node.name và node.label để bắt tên
+                    checks = " ".join([
+                        (img.name or "").lower(),
+                        (node.name or "").lower(),
+                        (node.label or "").lower()
+                    ])
+
+                    if any(k in checks for k in ("base", "albedo", "diffuse")):
+                        export_image(img, mat.name, "BaseColor", props, mat_dir, operator)
+                    elif "normal" in checks:
+                        export_image(img, mat.name, "Normal", props, mat_dir, operator)
+                    elif "rough" in checks:
+                        export_image(img, mat.name, "Roughness", props, mat_dir, operator)
+                    elif "metal" in checks:
+                        export_image(img, mat.name, "Metallic", props, mat_dir, operator)
+                    elif any(k in checks for k in ("ao", "occlusion", "ambient")):
+                        export_image(img, mat.name, "AO", props, mat_dir, operator)
+                    elif any(k in checks for k in ("emis", "emit")):
+                        export_image(img, mat.name, "Emissive", props, mat_dir, operator)
+                    elif any(k in checks for k in ("height", "disp", "displacement")):
+                        export_image(img, mat.name, "Height", props, mat_dir, operator)
+                    elif any(k in checks for k in ("alpha", "opacity", "trans")):
+                        export_image(img, mat.name, "Opacity", props, mat_dir, operator)
+                    elif "spec" in checks:
+                        export_image(img, mat.name, "Specular", props, mat_dir, operator)
+                    else:
+                        # Nếu không nằm trong danh sách trên, xuất theo tên gốc (tiện cho trường hợp custom)
+                        # Bạn có thể bỏ dòng này nếu không muốn xuất file lạ
+                        safe_name = (img.name or "texture").replace(" ", "_")
+                        export_image(img, mat.name, safe_name, props, mat_dir, operator)
 
 # =========================
 #   Operators
